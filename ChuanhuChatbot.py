@@ -1,332 +1,478 @@
-import json
-import gradio as gr
-# import openai
+# -*- coding:utf-8 -*-
 import os
+import logging
 import sys
-import traceback
-import requests
-# import markdown
-import csv
 
-my_api_key = ""    # 在这里输入你的 API 密钥
-initial_prompt = "You are a helpful assistant."
-API_URL = "https://api.openai.com/v1/chat/completions"
-HISTORY_DIR = "history"
-TEMPLATES_DIR = "templates"
+import gradio as gr
 
+from modules import config
+from modules.config import *
+from modules.utils import *
+from modules.presets import *
+from modules.overwrites import *
+from modules.models.models import get_model
 
 
-#if we are running in Docker
-if os.environ.get('dockerrun') == 'yes':
-    dockerflag = True
-else:
-    dockerflag = False
+gr.Chatbot._postprocess_chat_messages = postprocess_chat_messages
+gr.Chatbot.postprocess = postprocess
+PromptHelper.compact_text_chunks = compact_text_chunks
 
-if dockerflag:
-    my_api_key = os.environ.get('my_api_key')
-    if my_api_key == "empty":
-        print("Please give a api key!")
-        sys.exit(1)
-    #auth
-    username = os.environ.get('USERNAME')
-    password = os.environ.get('PASSWORD')
-    if isinstance(username, type(None)) or isinstance(password, type(None)):
-        authflag = False
-    else:
-        authflag = True
+with open("assets/custom.css", "r", encoding="utf-8") as f:
+    customCSS = f.read()
 
+def create_new_model():
+    return get_model(model_name = MODELS[DEFAULT_MODEL], access_key = my_api_key)[0]
 
-def parse_text(text):
-    lines = text.split("\n")
-    count = 0
-    for i, line in enumerate(lines):
-        if "```" in line:
-            count += 1
-            items = line.split('`')
-            if count % 2 == 1:
-                lines[i] = f'<pre><code class="{items[-1]}">'
-            else:
-                lines[i] = f'</code></pre>'
-        else:
-            if i > 0:
-                if count % 2 == 1:
-                    line = line.replace("&", "&amp;")
-                    line = line.replace("\"", "&quot;")
-                    line = line.replace("\'", "&apos;")
-                    line = line.replace("<", "&lt;")
-                    line = line.replace(">", "&gt;")
-                    line = line.replace(" ", "&nbsp;")
-                # lines[i] = '<br/>'+line
-                if i > 0 and count % 2 == 0:
-                    lines[i] = "<br/>"+line
-                else:
-                    lines[i] = line
-    return "".join(lines)
+with gr.Blocks(css=customCSS, theme=small_and_beautiful_theme) as demo:
+    user_name = gr.State("")
+    promptTemplates = gr.State(load_template(get_template_names(plain=True)[0], mode=2))
+    user_question = gr.State("")
+    user_api_key = gr.State(my_api_key)
+    current_model = gr.State(create_new_model)
 
-def predict(inputs, top_p, temperature, openai_api_key, chatbot=[], history=[], system_prompt=initial_prompt, retry=False, summary=False):  # repetition_penalty, top_k
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {openai_api_key}"
-    }
-
-    chat_counter = len(history) // 2
-
-    print(f"chat_counter - {chat_counter}")
-
-    messages = [compose_system(system_prompt)]
-    if chat_counter:
-        for data in chatbot:
-            temp1 = {}
-            temp1["role"] = "user"
-            temp1["content"] = data[0]
-            temp2 = {}
-            temp2["role"] = "assistant"
-            temp2["content"] = data[1]
-            if temp1["content"] != "":
-                messages.append(temp1)
-                messages.append(temp2)
-            else:
-                messages[-1]['content'] = temp2['content']
-    if retry and chat_counter:
-        messages.pop()
-    elif summary:
-        messages.append(compose_user(
-            "请帮我总结一下上述对话的内容，实现减少字数的同时，保证对话的质量。在总结中不要加入这一句话。"))
-        history = ["我们刚刚聊了什么？"]
-    else:
-        temp3 = {}
-        temp3["role"] = "user"
-        temp3["content"] = inputs
-        messages.append(temp3)
-        chat_counter += 1
-    # messages
-    payload = {
-        "model": "gpt-3.5-turbo",
-        "messages": messages,  # [{"role": "user", "content": f"{inputs}"}],
-        "temperature": temperature,  # 1.0,
-        "top_p": top_p,  # 1.0,
-        "n": 1,
-        "stream": True,
-        "presence_penalty": 0,
-        "frequency_penalty": 0,
-    }
-
-    if not summary:
-        history.append(inputs)
-    print(f"payload is - {payload}")
-    # make a POST request to the API endpoint using the requests.post method, passing in stream=True
-    response = requests.post(API_URL, headers=headers,
-                             json=payload, stream=True)
-    #response = requests.post(API_URL, headers=headers, json=payload, stream=True)
-
-    token_counter = 0
-    partial_words = ""
-
-    counter = 0
-    chatbot.append((history[-1], ""))
-    for chunk in response.iter_lines():
-        if counter == 0:
-            counter += 1
-            continue
-        counter += 1
-        # check whether each line is non-empty
-        if chunk:
-            # decode each line as response data is in bytes
-            try:
-                if len(json.loads(chunk.decode()[6:])['choices'][0]["delta"]) == 0:
-                    break
-            except Exception as e:
-                chatbot.pop()
-                chatbot.append((history[-1], f"☹️发生了错误\n返回值：{response.text}\n异常：{e}"))
-                history.pop()
-                yield chatbot, history
-                break
-            #print(json.loads(chunk.decode()[6:])['choices'][0]["delta"]    ["content"])
-            partial_words = partial_words + \
-                json.loads(chunk.decode()[6:])[
-                    'choices'][0]["delta"]["content"]
-            if token_counter == 0:
-                history.append(" " + partial_words)
-            else:
-                history[-1] = parse_text(partial_words)
-            chatbot[-1] = (history[-2], history[-1])
-        #   chat = [(history[i], history[i + 1]) for i in range(0, len(history)     - 1, 2) ]  # convert to tuples of list
-            token_counter += 1
-            # resembles {chatbot: chat,     state: history}
-            yield chatbot, history
-
-
-
-def delete_last_conversation(chatbot, history):
-    chatbot.pop()
-    history.pop()
-    history.pop()
-    return chatbot, history
-
-def save_chat_history(filename, system, history, chatbot):
-    if filename == "":
-        return
-    if not filename.endswith(".json"):
-        filename += ".json"
-    os.makedirs(HISTORY_DIR, exist_ok=True)
-    json_s = {"system": system, "history": history, "chatbot": chatbot}
-    with open(os.path.join(HISTORY_DIR, filename), "w") as f:
-        json.dump(json_s, f)
-
-
-def load_chat_history(filename):
-    with open(os.path.join(HISTORY_DIR, filename), "r") as f:
-        json_s = json.load(f)
-    return filename, json_s["system"], json_s["history"], json_s["chatbot"]
-
-
-def get_file_names(dir, plain=False, filetype=".json"):
-    # find all json files in the current directory and return their names
-    try:
-        files = [f for f in os.listdir(dir) if f.endswith(filetype)]
-    except FileNotFoundError:
-        files = []
-    if plain:
-        return files
-    else:
-        return gr.Dropdown.update(choices=files)
-
-def get_history_names(plain=False):
-    return get_file_names(HISTORY_DIR, plain)
-
-def load_template(filename):
-    lines = []
-    with open(os.path.join(TEMPLATES_DIR, filename), "r", encoding="utf8") as csvfile:
-        reader = csv.reader(csvfile)
-        lines = list(reader)
-    lines = lines[1:]
-    return {row[0]:row[1] for row in lines}, gr.Dropdown.update(choices=[row[0] for row in lines])
-
-def get_template_names(plain=False):
-    return get_file_names(TEMPLATES_DIR, plain, filetype=".csv")
-
-def reset_state():
-    return [], []
-
-
-def compose_system(system_prompt):
-    return {"role": "system", "content": system_prompt}
-
-
-def compose_user(user_input):
-    return {"role": "user", "content": user_input}
-
-
-def reset_textbox():
-    return gr.update(value='')
-
-title = """<h1 align="center">川虎ChatGPT 🚀</h1>"""
-description = """<div align=center>
-
-由Bilibili [土川虎虎虎](https://space.bilibili.com/29125536) 开发
-
-访问川虎ChatGPT的 [GitHub项目](https://github.com/GaiZhenbiao/ChuanhuChatGPT) 下载最新版脚本
-
-此App使用 `gpt-3.5-turbo` 大语言模型
-</div>
-"""
-with gr.Blocks() as demo:
-    gr.HTML(title)
-    keyTxt = gr.Textbox(show_label=True, placeholder=f"在这里输入你的OpenAI API-key...",
-                        value=my_api_key, label="API Key", type="password").style(container=True)
-    chatbot = gr.Chatbot()  # .style(color_map=("#1D51EE", "#585A5B"))
-    history = gr.State([])
-    promptTemplates = gr.State({})
-    TRUECOMSTANT = gr.State(True)
-    FALSECONSTANT = gr.State(False)
-    topic = gr.State("未命名对话历史记录")
+    topic = gr.State(i18n("未命名对话历史记录"))
 
     with gr.Row():
-        with gr.Column(scale=12):
-            txt = gr.Textbox(show_label=False, placeholder="在这里输入").style(
-                container=False)
-        with gr.Column(min_width=50, scale=1):
-            submitBtn = gr.Button("🚀", variant="primary")
-    with gr.Row():
-        emptyBtn = gr.Button("🧹 新的对话")
-        retryBtn = gr.Button("🔄 重新生成")
-        delLastBtn = gr.Button("🗑️ 删除上条对话")
-        reduceTokenBtn = gr.Button("♻️ 总结对话")
-    systemPromptTxt = gr.Textbox(show_label=True, placeholder=f"在这里输入System Prompt...",
-                                 label="System prompt", value=initial_prompt).style(container=True)
-    with gr.Accordion(label="加载Prompt模板", open=False):
+        gr.HTML(CHUANHU_TITLE, elem_id="app_title")
+        status_display = gr.Markdown(get_geoip(), elem_id="status_display")
+    with gr.Row(elem_id="float_display"):
+        user_info = gr.Markdown(value="getting user info...", elem_id="user_info")
+
+        # https://github.com/gradio-app/gradio/pull/3296
+        def create_greeting(request: gr.Request):
+            if hasattr(request, "username") and request.username: # is not None or is not ""
+                logging.info(f"Get User Name: {request.username}")
+                return gr.Markdown.update(value=f"User: {request.username}"), request.username
+            else:
+                return gr.Markdown.update(value=f"User: default", visible=False), ""
+        demo.load(create_greeting, inputs=None, outputs=[user_info, user_name])
+
+    with gr.Row().style(equal_height=True):
+        with gr.Column(scale=5):
+            with gr.Row():
+                chatbot = gr.Chatbot(elem_id="chuanhu_chatbot").style(height="100%")
+            with gr.Row():
+                with gr.Column(min_width=225, scale=12):
+                    user_input = gr.Textbox(
+                        elem_id="user_input_tb",
+                        show_label=False, placeholder=i18n("在这里输入")
+                    ).style(container=False)
+                with gr.Column(min_width=42, scale=1):
+                    submitBtn = gr.Button(value="", variant="primary", elem_id="submit_btn")
+                    cancelBtn = gr.Button(value="", variant="secondary", visible=False, elem_id="cancel_btn")
+            with gr.Row():
+                emptyBtn = gr.Button(
+                    i18n("🧹 新的对话"),
+                )
+                retryBtn = gr.Button(i18n("🔄 重新生成"))
+                delFirstBtn = gr.Button(i18n("🗑️ 删除最旧对话"))
+                delLastBtn = gr.Button(i18n("🗑️ 删除最新对话"))
+                with gr.Row(visible=False) as like_dislike_area:
+                    with gr.Column(min_width=20, scale=1):
+                        likeBtn = gr.Button(i18n("👍"))
+                    with gr.Column(min_width=20, scale=1):
+                        dislikeBtn = gr.Button(i18n("👎"))
+
         with gr.Column():
-            with gr.Row():
-                with gr.Column(scale=6):
-                    templateFileSelectDropdown = gr.Dropdown(label="选择Prompt模板集合文件（.csv）", choices=get_template_names(plain=True), multiselect=False)
-                with gr.Column(scale=1):
-                    templateRefreshBtn = gr.Button("🔄 刷新")
-                    templaeFileReadBtn = gr.Button("📂 读入模板")
-            with gr.Row():
-                with gr.Column(scale=6):
-                    templateSelectDropdown = gr.Dropdown(label="从Prompt模板中加载", choices=[], multiselect=False)
-                with gr.Column(scale=1):
-                    templateApplyBtn = gr.Button("⬇️ 应用")
-    with gr.Accordion(label="保存/加载对话历史记录(在文本框中输入文件名，点击“保存对话”按钮，历史记录文件会被存储到Python文件旁边)", open=False):
-        with gr.Column():
-            with gr.Row():
-                with gr.Column(scale=6):
-                    saveFileName = gr.Textbox(
-                        show_label=True, placeholder=f"在这里输入保存的文件名...", label="设置保存文件名", value="对话历史记录").style(container=True)
-                with gr.Column(scale=1):
-                    saveBtn = gr.Button("💾 保存对话")
-            with gr.Row():
-                with gr.Column(scale=6):
-                    historyFileSelectDropdown = gr.Dropdown(label="从列表中加载对话", choices=get_history_names(plain=True), multiselect=False)
-                with gr.Column(scale=1):
-                    historyRefreshBtn = gr.Button("🔄 刷新")
-                    historyReadBtn = gr.Button("📂 读入对话")
-    #inputs, top_p, temperature, top_k, repetition_penalty
-    with gr.Accordion("参数", open=False):
-        top_p = gr.Slider(minimum=-0, maximum=1.0, value=1.0, step=0.05,
-                          interactive=True, label="Top-p (nucleus sampling)",)
-        temperature = gr.Slider(minimum=-0, maximum=5.0, value=1.0,
-                                step=0.1, interactive=True, label="Temperature",)
-        #top_k = gr.Slider( minimum=1, maximum=50, value=4, step=1, interactive=True, label="Top-k",)
-        #repetition_penalty = gr.Slider( minimum=0.1, maximum=3.0, value=1.03, step=0.01, interactive=True, label="Repetition Penalty", )
-    gr.Markdown(description)
+            with gr.Column(min_width=50, scale=1):
+                with gr.Tab(label=i18n("模型")):
+                    keyTxt = gr.Textbox(
+                        show_label=True,
+                        placeholder=f"Your API-key...",
+                        value=hide_middle_chars(user_api_key.value),
+                        type="password",
+                        visible=not HIDE_MY_KEY,
+                        label="API-Key",
+                    )
+                    if multi_api_key:
+                        usageTxt = gr.Markdown(i18n("多账号模式已开启，无需输入key，可直接开始对话"), elem_id="usage_display", elem_classes="insert_block")
+                    else:
+                        usageTxt = gr.Markdown(i18n("**发送消息** 或 **提交key** 以显示额度"), elem_id="usage_display", elem_classes="insert_block")
+                    model_select_dropdown = gr.Dropdown(
+                        label=i18n("选择模型"), choices=MODELS, multiselect=False, value=MODELS[DEFAULT_MODEL], interactive=True
+                    )
+                    lora_select_dropdown = gr.Dropdown(
+                        label=i18n("选择LoRA模型"), choices=[], multiselect=False, interactive=True, visible=False
+                    )
+                    with gr.Row():
+                        use_streaming_checkbox = gr.Checkbox(
+                            label=i18n("实时传输回答"), value=True, visible=ENABLE_STREAMING_OPTION
+                        )
+                        single_turn_checkbox = gr.Checkbox(label=i18n("单轮对话"), value=False)
+                        use_websearch_checkbox = gr.Checkbox(label=i18n("使用在线搜索"), value=False)
+                        render_latex_checkbox = gr.Checkbox(
+                            label=i18n("渲染LaTeX公式"), value=render_latex, interactive=True, elem_id="render_latex_checkbox"
+                        )
+                    language_select_dropdown = gr.Dropdown(
+                        label=i18n("选择回复语言（针对搜索&索引功能）"),
+                        choices=REPLY_LANGUAGES,
+                        multiselect=False,
+                        value=REPLY_LANGUAGES[0],
+                    )
+                    index_files = gr.Files(label=i18n("上传"), type="file")
+                    two_column = gr.Checkbox(label=i18n("双栏pdf"), value=advance_docs["pdf"].get("two_column", False))
+                    # TODO: 公式ocr
+                    # formula_ocr = gr.Checkbox(label=i18n("识别公式"), value=advance_docs["pdf"].get("formula_ocr", False))
+
+                with gr.Tab(label="Prompt"):
+                    systemPromptTxt = gr.Textbox(
+                        show_label=True,
+                        placeholder=i18n("在这里输入System Prompt..."),
+                        label="System prompt",
+                        value=INITIAL_SYSTEM_PROMPT,
+                        lines=10,
+                    ).style(container=False)
+                    with gr.Accordion(label=i18n("加载Prompt模板"), open=True):
+                        with gr.Column():
+                            with gr.Row():
+                                with gr.Column(scale=6):
+                                    templateFileSelectDropdown = gr.Dropdown(
+                                        label=i18n("选择Prompt模板集合文件"),
+                                        choices=get_template_names(plain=True),
+                                        multiselect=False,
+                                        value=get_template_names(plain=True)[0],
+                                    ).style(container=False)
+                                with gr.Column(scale=1):
+                                    templateRefreshBtn = gr.Button(i18n("🔄 刷新"))
+                            with gr.Row():
+                                with gr.Column():
+                                    templateSelectDropdown = gr.Dropdown(
+                                        label=i18n("从Prompt模板中加载"),
+                                        choices=load_template(
+                                            get_template_names(plain=True)[0], mode=1
+                                        ),
+                                        multiselect=False,
+                                    ).style(container=False)
+
+                with gr.Tab(label=i18n("保存/加载")):
+                    with gr.Accordion(label=i18n("保存/加载对话历史记录"), open=True):
+                        with gr.Column():
+                            with gr.Row():
+                                with gr.Column(scale=6):
+                                    historyFileSelectDropdown = gr.Dropdown(
+                                        label=i18n("从列表中加载对话"),
+                                        choices=get_history_names(plain=True),
+                                        multiselect=False,
+                                        value=get_history_names(plain=True)[0],
+                                    )
+                                with gr.Column(scale=1):
+                                    historyRefreshBtn = gr.Button(i18n("🔄 刷新"))
+                            with gr.Row():
+                                with gr.Column(scale=6):
+                                    saveFileName = gr.Textbox(
+                                        show_label=True,
+                                        placeholder=i18n("设置文件名: 默认为.json，可选为.md"),
+                                        label=i18n("设置保存文件名"),
+                                        value=i18n("对话历史记录"),
+                                    ).style(container=True)
+                                with gr.Column(scale=1):
+                                    saveHistoryBtn = gr.Button(i18n("💾 保存对话"))
+                                    exportMarkdownBtn = gr.Button(i18n("📝 导出为Markdown"))
+                                    gr.Markdown(i18n("默认保存于history文件夹"))
+                            with gr.Row():
+                                with gr.Column():
+                                    downloadFile = gr.File(interactive=True)
+
+                with gr.Tab(label=i18n("高级")):
+                    gr.Markdown(i18n("# ⚠️ 务必谨慎更改 ⚠️\n\n如果无法使用请恢复默认设置"))
+                    gr.HTML(APPEARANCE_SWITCHER, elem_classes="insert_block")
+                    with gr.Accordion(i18n("参数"), open=False):
+                        temperature_slider = gr.Slider(
+                            minimum=-0,
+                            maximum=2.0,
+                            value=1.0,
+                            step=0.1,
+                            interactive=True,
+                            label="temperature",
+                        )
+                        top_p_slider = gr.Slider(
+                            minimum=-0,
+                            maximum=1.0,
+                            value=1.0,
+                            step=0.05,
+                            interactive=True,
+                            label="top-p",
+                        )
+                        n_choices_slider = gr.Slider(
+                            minimum=1,
+                            maximum=10,
+                            value=1,
+                            step=1,
+                            interactive=True,
+                            label="n choices",
+                        )
+                        stop_sequence_txt = gr.Textbox(
+                            show_label=True,
+                            placeholder=i18n("在这里输入停止符，用英文逗号隔开..."),
+                            label="stop",
+                            value="",
+                            lines=1,
+                        )
+                        max_context_length_slider = gr.Slider(
+                            minimum=1,
+                            maximum=32768,
+                            value=2000,
+                            step=1,
+                            interactive=True,
+                            label="max context",
+                        )
+                        max_generation_slider = gr.Slider(
+                            minimum=1,
+                            maximum=32768,
+                            value=1000,
+                            step=1,
+                            interactive=True,
+                            label="max generations",
+                        )
+                        presence_penalty_slider = gr.Slider(
+                            minimum=-2.0,
+                            maximum=2.0,
+                            value=0.0,
+                            step=0.01,
+                            interactive=True,
+                            label="presence penalty",
+                        )
+                        frequency_penalty_slider = gr.Slider(
+                            minimum=-2.0,
+                            maximum=2.0,
+                            value=0.0,
+                            step=0.01,
+                            interactive=True,
+                            label="frequency penalty",
+                        )
+                        logit_bias_txt = gr.Textbox(
+                            show_label=True,
+                            placeholder=f"word:likelihood",
+                            label="logit bias",
+                            value="",
+                            lines=1,
+                        )
+                        user_identifier_txt = gr.Textbox(
+                            show_label=True,
+                            placeholder=i18n("用于定位滥用行为"),
+                            label=i18n("用户名"),
+                            value=user_name.value,
+                            lines=1,
+                        )
+
+                    with gr.Accordion(i18n("网络设置"), open=False):
+                        # 优先展示自定义的api_host
+                        apihostTxt = gr.Textbox(
+                            show_label=True,
+                            placeholder=i18n("在这里输入API-Host..."),
+                            label="API-Host",
+                            value=config.api_host or shared.API_HOST,
+                            lines=1,
+                        )
+                        changeAPIURLBtn = gr.Button(i18n("🔄 切换API地址"))
+                        proxyTxt = gr.Textbox(
+                            show_label=True,
+                            placeholder=i18n("在这里输入代理地址..."),
+                            label=i18n("代理地址（示例：http://127.0.0.1:10809）"),
+                            value="",
+                            lines=2,
+                        )
+                        changeProxyBtn = gr.Button(i18n("🔄 设置代理地址"))
+                        default_btn = gr.Button(i18n("🔙 恢复默认设置"))
+
+    gr.Markdown(CHUANHU_DESCRIPTION, elem_id="description")
+    gr.HTML(FOOTER.format(versions=versions_html()), elem_id="footer")
+    demo.load(refresh_ui_elements_on_load, [current_model, model_select_dropdown], [like_dislike_area], show_progress=False)
+    chatgpt_predict_args = dict(
+        fn=predict,
+        inputs=[
+            current_model,
+            user_question,
+            chatbot,
+            use_streaming_checkbox,
+            use_websearch_checkbox,
+            index_files,
+            language_select_dropdown,
+        ],
+        outputs=[chatbot, status_display],
+        show_progress=True,
+    )
+
+    start_outputing_args = dict(
+        fn=start_outputing,
+        inputs=[],
+        outputs=[submitBtn, cancelBtn],
+        show_progress=True,
+    )
+
+    end_outputing_args = dict(
+        fn=end_outputing, inputs=[], outputs=[submitBtn, cancelBtn]
+    )
+
+    reset_textbox_args = dict(
+        fn=reset_textbox, inputs=[], outputs=[user_input]
+    )
+
+    transfer_input_args = dict(
+        fn=transfer_input, inputs=[user_input], outputs=[user_question, user_input, submitBtn, cancelBtn], show_progress=True
+    )
+
+    get_usage_args = dict(
+        fn=billing_info, inputs=[current_model], outputs=[usageTxt], show_progress=False
+    )
+
+    load_history_from_file_args = dict(
+        fn=load_chat_history,
+        inputs=[current_model, historyFileSelectDropdown, chatbot, user_name],
+        outputs=[saveFileName, systemPromptTxt, chatbot]
+    )
 
 
-    txt.submit(predict, [txt, top_p, temperature, keyTxt,
-               chatbot, history, systemPromptTxt], [chatbot, history])
-    txt.submit(reset_textbox, [], [txt])
-    submitBtn.click(predict, [txt, top_p, temperature, keyTxt, chatbot,
-                    history, systemPromptTxt], [chatbot, history], show_progress=True)
-    submitBtn.click(reset_textbox, [], [txt])
-    emptyBtn.click(reset_state, outputs=[chatbot, history])
-    retryBtn.click(predict, [txt, top_p, temperature, keyTxt, chatbot, history,
-                   systemPromptTxt, TRUECOMSTANT], [chatbot, history], show_progress=True)
-    delLastBtn.click(delete_last_conversation, [chatbot, history], [
-                     chatbot, history], show_progress=True)
-    reduceTokenBtn.click(predict, [txt, top_p, temperature, keyTxt, chatbot, history,
-                         systemPromptTxt, FALSECONSTANT, TRUECOMSTANT], [chatbot, history], show_progress=True)
-    saveBtn.click(save_chat_history, [
-                  saveFileName, systemPromptTxt, history, chatbot], None, show_progress=True)
-    saveBtn.click(get_history_names, None, [historyFileSelectDropdown])
-    historyRefreshBtn.click(get_history_names, None, [historyFileSelectDropdown])
-    historyReadBtn.click(load_chat_history, [historyFileSelectDropdown],  [saveFileName, systemPromptTxt, history, chatbot], show_progress=True)
+    # Chatbot
+    cancelBtn.click(interrupt, [current_model], [])
+
+    user_input.submit(**transfer_input_args).then(**chatgpt_predict_args).then(**end_outputing_args)
+    user_input.submit(**get_usage_args)
+
+    submitBtn.click(**transfer_input_args).then(**chatgpt_predict_args).then(**end_outputing_args)
+    submitBtn.click(**get_usage_args)
+
+    index_files.change(handle_file_upload, [current_model, index_files, chatbot], [index_files, chatbot, status_display])
+
+    emptyBtn.click(
+        reset,
+        inputs=[current_model],
+        outputs=[chatbot, status_display],
+        show_progress=True,
+    )
+
+    retryBtn.click(**start_outputing_args).then(
+        retry,
+        [
+            current_model,
+            chatbot,
+            use_streaming_checkbox,
+            use_websearch_checkbox,
+            index_files,
+            language_select_dropdown,
+        ],
+        [chatbot, status_display],
+        show_progress=True,
+    ).then(**end_outputing_args)
+    retryBtn.click(**get_usage_args)
+
+    delFirstBtn.click(
+        delete_first_conversation,
+        [current_model],
+        [status_display],
+    )
+
+    delLastBtn.click(
+        delete_last_conversation,
+        [current_model, chatbot],
+        [chatbot, status_display],
+        show_progress=False
+    )
+
+    likeBtn.click(
+        like,
+        [current_model],
+        [status_display],
+        show_progress=False
+    )
+
+    dislikeBtn.click(
+        dislike,
+        [current_model],
+        [status_display],
+        show_progress=False
+    )
+
+    two_column.change(update_doc_config, [two_column], None)
+
+    # LLM Models
+    keyTxt.change(set_key, [current_model, keyTxt], [user_api_key, status_display]).then(**get_usage_args)
+    keyTxt.submit(**get_usage_args)
+    single_turn_checkbox.change(set_single_turn, [current_model, single_turn_checkbox], None)
+    model_select_dropdown.change(get_model, [model_select_dropdown, lora_select_dropdown, user_api_key, temperature_slider, top_p_slider, systemPromptTxt], [current_model, status_display, lora_select_dropdown], show_progress=True)
+    model_select_dropdown.change(toggle_like_btn_visibility, [model_select_dropdown], [like_dislike_area], show_progress=False)
+    lora_select_dropdown.change(get_model, [model_select_dropdown, lora_select_dropdown, user_api_key, temperature_slider, top_p_slider, systemPromptTxt], [current_model, status_display], show_progress=True)
+
+    # Template
+    systemPromptTxt.change(set_system_prompt, [current_model, systemPromptTxt], None)
     templateRefreshBtn.click(get_template_names, None, [templateFileSelectDropdown])
-    templaeFileReadBtn.click(load_template, [templateFileSelectDropdown],  [promptTemplates, templateSelectDropdown], show_progress=True)
-    templateApplyBtn.click(lambda x, y: x[y], [promptTemplates, templateSelectDropdown],  [systemPromptTxt], show_progress=True)
+    templateFileSelectDropdown.change(
+        load_template,
+        [templateFileSelectDropdown],
+        [promptTemplates, templateSelectDropdown],
+        show_progress=True,
+    )
+    templateSelectDropdown.change(
+        get_template_content,
+        [promptTemplates, templateSelectDropdown, systemPromptTxt],
+        [systemPromptTxt],
+        show_progress=True,
+    )
 
-print("川虎的温馨提示：访问 http://localhost:7860 查看界面")
+    # S&L
+    saveHistoryBtn.click(
+        save_chat_history,
+        [current_model, saveFileName, chatbot, user_name],
+        downloadFile,
+        show_progress=True,
+    )
+    saveHistoryBtn.click(get_history_names, [gr.State(False), user_name], [historyFileSelectDropdown])
+    exportMarkdownBtn.click(
+        export_markdown,
+        [current_model, saveFileName, chatbot, user_name],
+        downloadFile,
+        show_progress=True,
+    )
+    historyRefreshBtn.click(get_history_names, [gr.State(False), user_name], [historyFileSelectDropdown])
+    historyFileSelectDropdown.change(**load_history_from_file_args)
+    downloadFile.change(**load_history_from_file_args)
+
+    # Advanced
+    max_context_length_slider.change(set_token_upper_limit, [current_model, max_context_length_slider], None)
+    temperature_slider.change(set_temperature, [current_model, temperature_slider], None)
+    top_p_slider.change(set_top_p, [current_model, top_p_slider], None)
+    n_choices_slider.change(set_n_choices, [current_model, n_choices_slider], None)
+    stop_sequence_txt.change(set_stop_sequence, [current_model, stop_sequence_txt], None)
+    max_generation_slider.change(set_max_tokens, [current_model, max_generation_slider], None)
+    presence_penalty_slider.change(set_presence_penalty, [current_model, presence_penalty_slider], None)
+    frequency_penalty_slider.change(set_frequency_penalty, [current_model, frequency_penalty_slider], None)
+    logit_bias_txt.change(set_logit_bias, [current_model, logit_bias_txt], None)
+    user_identifier_txt.change(set_user_identifier, [current_model, user_identifier_txt], None)
+
+    default_btn.click(
+        reset_default, [], [apihostTxt, proxyTxt, status_display], show_progress=True
+    )
+    changeAPIURLBtn.click(
+        change_api_host,
+        [apihostTxt],
+        [status_display],
+        show_progress=True,
+    )
+    changeProxyBtn.click(
+        change_proxy,
+        [proxyTxt],
+        [status_display],
+        show_progress=True,
+    )
+
+logging.info(
+    colorama.Back.GREEN
+    + "\n川虎的温馨提示：访问 http://localhost:7860 查看界面"
+    + colorama.Style.RESET_ALL
+)
 # 默认开启本地服务器，默认可以直接从IP访问，默认不创建公开分享链接
-demo.title = "川虎ChatGPT 🚀"
+demo.title = i18n("川虎Chat 🚀")
 
-#if running in Docker
-if dockerflag:
-    if authflag:
-        demo.queue().launch(server_name="0.0.0.0", server_port=7860,auth=(username, password))
-    else:
-        demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=False)
-#if not running in Docker
-else:
-    demo.queue().launch(server_name = "0.0.0.0", share=False) # 改为 share=True 可以创建公开分享链接
-    #demo.queue().launch(server_name="0.0.0.0", server_port=7860, share=False) # 可自定义端口
-    #demo.queue().launch(server_name="0.0.0.0", server_port=7860,auth=("在这里填写用户名", "在这里填写密码")) # 可设置用户名与密码
+if __name__ == "__main__":
+    reload_javascript()
+    demo.queue(concurrency_count=CONCURRENT_COUNT).launch(
+        server_name=server_name,
+        server_port=server_port,
+        share=share,
+        auth=auth_list if authflag else None,
+        favicon_path="./assets/favicon.ico",
+        inbrowser=not dockerflag, # 禁止在docker下开启inbrowser
+    )
+    # demo.queue(concurrency_count=CONCURRENT_COUNT).launch(server_name="0.0.0.0", server_port=7860, share=False) # 可自定义端口
+    # demo.queue(concurrency_count=CONCURRENT_COUNT).launch(server_name="0.0.0.0", server_port=7860,auth=("在这里填写用户名", "在这里填写密码")) # 可设置用户名与密码
+    # demo.queue(concurrency_count=CONCURRENT_COUNT).launch(auth=("在这里填写用户名", "在这里填写密码")) # 适合Nginx反向代理
